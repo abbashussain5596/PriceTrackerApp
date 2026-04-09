@@ -29,8 +29,7 @@ class PriceRepositoryImpl(
 ) : PriceRepository {
 
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var priceFeedJob: Job? = null
-    private var connectionJob: Job? = null
+    private var feedJob: Job? = null
     private val _isRunning = MutableStateFlow(false)
 
     private val currentPrices = mutableMapOf<String, Double>()
@@ -58,47 +57,39 @@ class PriceRepositoryImpl(
     override suspend fun getStockSymbols(): List<String> = StockSymbols.SYMBOLS
 
     override suspend fun startPriceFeed() {
-        if (_isRunning.value && priceFeedJob?.isActive == true) return
+        if (feedJob?.isActive == true) return
 
-        priceFeedJob?.cancel()
-        connectionJob?.cancel()
+        feedJob?.cancel()
+        _isRunning.value = true
 
-        connectionJob = repositoryScope.launch {
-            webSocketDataSource.connect().collect { connected ->
-                _isRunning.value = connected
-            }
-        }
+        feedJob = repositoryScope.launch {
+            // Open the WebSocket and suspend until it reports connected.
+            // connect() opens the socket eagerly as a side effect, then returns
+            // observeConnectionState() — so .first { it } waits for the first true event.
+            webSocketDataSource.connect().first { it }
 
-        priceFeedJob = repositoryScope.launch {
-            // Suspend until the connection is established — no polling needed
-            webSocketDataSource.observeConnectionState().first { it }
-
-            // Send initial batch once connected
             sendPriceUpdatesForAllSymbols()
 
-            // Continue sending every 2 seconds for as long as connected
             while (isActive) {
-                delay(2000)
+                delay(Config.PRICE_UPDATE_INTERVAL_MS)
                 sendPriceUpdatesForAllSymbols()
             }
         }
+
+        feedJob?.invokeOnCompletion { _isRunning.value = false }
     }
 
     override suspend fun stopPriceFeed() {
-        priceFeedJob?.cancel()
-        priceFeedJob = null
-        connectionJob?.cancel()
-        connectionJob = null
+        feedJob?.cancel()
+        feedJob = null
         webSocketDataSource.disconnect()
-        _isRunning.value = false
     }
 
     override fun observePriceUpdates(): Flow<StockPrice> = _priceUpdatesFlow
 
     override fun observeConnectionState(): Flow<Boolean> = webSocketDataSource.observeConnectionState()
 
-    override fun isPriceFeedRunning(): Boolean =
-        _isRunning.value && priceFeedJob?.isActive == true
+    override fun isPriceFeedRunning(): Boolean = feedJob?.isActive == true
 
     override fun observeFeedRunningState(): Flow<Boolean> = _isRunning.asStateFlow()
 
@@ -113,21 +104,29 @@ class PriceRepositoryImpl(
 
     private fun generateRandomPrice(): Double {
         val random = Random()
-        return 10.0 + random.nextDouble() * (500.0 - 10.0)
+        return Config.MIN_BASE_PRICE + random.nextDouble() * (Config.MAX_BASE_PRICE - Config.MIN_BASE_PRICE)
     }
 
     private fun generatePriceUpdate(symbol: String): Double {
         val currentPrice = currentPrices[symbol] ?: generateRandomPrice()
         val random = Random()
-        val changePercent = -5.0 + random.nextDouble() * 10.0
+        val changePercent = -Config.MAX_CHANGE_PERCENT + random.nextDouble() * (Config.MAX_CHANGE_PERCENT * 2)
         val newPrice = currentPrice * (1 + changePercent / 100.0)
-        val roundedPrice = String.format("%.2f", newPrice).toDouble()
+        val roundedPrice = String.format("%.${Config.PRICE_DECIMAL_PLACES}f", newPrice).toDouble()
         currentPrices[symbol] = roundedPrice
         return roundedPrice
     }
 
     fun cleanup() {
-        priceFeedJob?.cancel()
+        feedJob?.cancel()
         repositoryScope.cancel()
     }
+}
+
+private object Config {
+    const val PRICE_UPDATE_INTERVAL_MS = 2000L
+    const val MIN_BASE_PRICE = 15.0
+    const val MAX_BASE_PRICE = 600.0
+    const val MAX_CHANGE_PERCENT = 7.0
+    const val PRICE_DECIMAL_PLACES = 2
 }
